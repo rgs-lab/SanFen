@@ -85,35 +85,105 @@
     return text.replace(/[\u2654-\u265F]/g, ch => map[ch] ?? '');
   }
 
+  function canonicalSan(text) {
+    return text
+      .replace(/0-0-0/gi, 'o-o-o')
+      .replace(/0-0/gi, 'o-o')
+      .replace(/[+#?!]/g, '')
+      .replace(/=/g, '')
+      .replace(/[^a-z0-9xo-]/gi, '')
+      .toLowerCase();
+  }
+
+  function cleanToken(token) {
+    return token
+      .replace(/[!?]+/g, '')
+      .replace(/[…]+/g, '')
+      .replace(/[†‡]/g, '')
+      .trim();
+  }
+
+  function tryApplyToken(game, token) {
+    if (!token || token === '...') return null;
+    const normalized = token
+      .replace(/^0-0-0$/i, 'O-O-O')
+      .replace(/^0-0$/i, 'O-O');
+
+    const directCandidates = [normalized];
+    for (const candidate of directCandidates) {
+      if (!candidate) continue;
+      try {
+        const move = game.move(candidate, { sloppy: true });
+        if (move) return move;
+      } catch (err) {
+        // try fallbacks below
+      }
+    }
+
+    const legalMoves = game.moves({ verbose: true });
+    const canonicalToken = canonicalSan(normalized);
+    const tokenTarget = canonicalToken.slice(-2);
+
+    const matchingMoves = [];
+    for (const legal of legalMoves) {
+      const canonicalLegal = canonicalSan(legal.san);
+      if (canonicalLegal === canonicalToken) {
+        matchingMoves.push({ legal, weight: 3 + (legal.flags.includes('c') ? 0.5 : 0) });
+        continue;
+      }
+      if (canonicalToken && canonicalLegal.endsWith(canonicalToken)) {
+        matchingMoves.push({ legal, weight: 2 + (legal.flags.includes('c') ? 0.5 : 0) });
+        continue;
+      }
+      if (canonicalToken && canonicalToken.length <= 3 && tokenTarget && canonicalLegal.endsWith(tokenTarget)) {
+        matchingMoves.push({ legal, weight: 1 + (legal.flags.includes('c') ? 0.5 : 0) });
+      }
+    }
+
+    let matched = null;
+    if (matchingMoves.length) {
+      matchingMoves.sort((a, b) => b.weight - a.weight);
+      matched = matchingMoves[0].legal;
+    }
+
+    if (!matched && /^[a-h][1-8]$/.test(tokenTarget)) {
+      const byTarget = legalMoves.filter(m => m.to === tokenTarget);
+      if (byTarget.length === 1) {
+        matched = byTarget[0];
+      }
+    }
+
+    if (matched) {
+      return game.move({ from: matched.from, to: matched.to, promotion: matched.promotion });
+    }
+
+    return null;
+  }
+
   function extractSanMoves(rawText) {
     const cleaned = normalizeFigurines(rawText)
       .replace(/\r?\n/g, ' ')
       .replace(/…/g, ' ')
-      .replace(/\d+\.(?:\s*\.{3})?/g, ' ') // remove move numbers like 12. or 12...
+      .replace(/\d+\.(?:\s*\.{3})?/g, ' ')
       .replace(/\b(?:1-0|0-1|1\/2-1\/2|\*)\b/g, ' ')
       .replace(/[\u00A0\t]+/g, ' ')
       .replace(/\s+/g, ' ');
 
-    const tentativeTokens = cleaned.split(' ').map(t => t.trim()).filter(Boolean);
-    const game = new window.Chess();
+    const tentativeTokens = cleaned.split(' ').map(t => cleanToken(t)).filter(Boolean);
+    const parsingGame = new window.Chess();
     const appliedMoves = [];
+    const ignored = [];
 
     for (const token of tentativeTokens) {
-      const stripped = token.replace(/[!?]+/g, '').replace(/[…]+/g, '');
-      if (!stripped || stripped === '...') continue;
-      const moveText = stripped.replace(/^0-0-0$/i, 'O-O-O').replace(/^0-0$/i, 'O-O');
-      if (!moveText) continue;
-      try {
-        const move = game.move(moveText, { sloppy: true });
-        if (move) {
-          appliedMoves.push(move);
-        }
-      } catch (err) {
-        // Skip tokens that cannot be parsed
+      const move = tryApplyToken(parsingGame, token);
+      if (move) {
+        appliedMoves.push(move);
+      } else {
+        ignored.push(token);
       }
     }
 
-    return appliedMoves;
+    return { moves: appliedMoves, ignored };
   }
 
   function evaluateMaterial(chess) {
@@ -156,7 +226,7 @@
   const rawMovesText = container.innerText || '';
   log('READ MOVES len=', rawMovesText.length);
 
-  const appliedMoves = extractSanMoves(rawMovesText);
+  const { moves: appliedMoves, ignored: ignoredTokens } = extractSanMoves(rawMovesText);
   const game = new window.Chess();
   for (const move of appliedMoves) {
     game.move(move.san, { sloppy: true });
@@ -164,6 +234,10 @@
 
   const sanHistory = appliedMoves.map(m => m.san);
   log('SAN COUNT=', sanHistory.length, sanHistory);
+
+  if (ignoredTokens.length) {
+    log('IGNORED TOKENS=', ignoredTokens);
+  }
 
   const verboseHistory = game.history({ verbose: true });
   const lastMove = verboseHistory[verboseHistory.length - 1] || null;
@@ -205,12 +279,13 @@
   }
 
   window.__CHESS = {
-    version: 'helper-2',
+    version: 'helper-3',
     fen: () => game.fen(),
     turn: () => game.turn(),
     legalSAN: () => game.moves(),
     legalPairs: () => game.moves({ verbose: true }).map(m => `${m.from.toUpperCase()}->${m.to.toUpperCase()} (${m.san})`),
     last: () => lastMove,
+    ignored: () => ignoredTokens.slice(),
     trySan: (san) => {
       try {
         const clone = new window.Chess(game.fen());
@@ -233,5 +308,5 @@
     }
   };
 
-  log('Helpers ready: __CHESS. Try __CHESS.legalSAN() or __CHESS.legalPairs() or __CHESS.trySan("Bxd2").');
+  log('Helpers ready: __CHESS. Try __CHESS.legalSAN(), __CHESS.legalPairs(), or __CHESS.trySan("Nf3").');
 })();
