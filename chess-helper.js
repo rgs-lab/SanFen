@@ -4,6 +4,7 @@
   const STOCKFISH_FAILURE_STORAGE_KEY = '__chess_helper_stockfish_failures__';
   const STOCKFISH_FAILURE_TTL = 1000 * 60 * 60 * 24 * 7; // 7 days
   const STOCKFISH_DISABLE_STORAGE_KEY = '__chess_helper_stockfish_disabled__';
+  const STOCKFISH_INLINE_STORAGE_KEY = '__chess_helper_stockfish_inline_base64__';
 
   function now() {
     return Date.now();
@@ -16,6 +17,15 @@
     } catch (err) {
       return null;
     }
+  }
+
+  function createChessInstance(fen) {
+    const globalObj = (typeof window !== 'undefined' && window) || (typeof self !== 'undefined' ? self : null);
+    const ChessCtor = globalObj && globalObj.Chess ? globalObj.Chess : null;
+    if (!ChessCtor) {
+      throw new Error('Chess.js library is not available');
+    }
+    return typeof fen === 'string' && fen ? new ChessCtor(fen) : new ChessCtor();
   }
 
   function loadStockfishFailureCache() {
@@ -53,6 +63,59 @@
 
   const stockfishFailureCache = loadStockfishFailureCache();
 
+  let inlineStockfishSessionBase64 = null;
+  let inlineStockfishPersistedBase64 = null;
+  let inlineStockfishPersistedLoaded = false;
+
+  function normalizeBase64(text) {
+    return (text || '').replace(/\s+/g, '').trim();
+  }
+
+  function estimateBase64DecodedSize(base64Text) {
+    const normalized = normalizeBase64(base64Text);
+    if (!normalized) return 0;
+    const padding = normalized.endsWith('==') ? 2 : normalized.endsWith('=') ? 1 : 0;
+    return Math.max(0, Math.floor((normalized.length * 3) / 4) - padding);
+  }
+
+  function loadPersistedInlineStockfishBase64() {
+    if (inlineStockfishPersistedLoaded) {
+      return inlineStockfishPersistedBase64;
+    }
+    inlineStockfishPersistedLoaded = true;
+    const store = safeLocalStorage();
+    if (!store) return null;
+    try {
+      const value = store.getItem(STOCKFISH_INLINE_STORAGE_KEY);
+      inlineStockfishPersistedBase64 = value ? normalizeBase64(value) : null;
+    } catch (err) {
+      inlineStockfishPersistedBase64 = null;
+    }
+    return inlineStockfishPersistedBase64;
+  }
+
+  function setPersistedInlineStockfishBase64(base64Text) {
+    inlineStockfishPersistedBase64 = base64Text ? normalizeBase64(base64Text) : null;
+    inlineStockfishPersistedLoaded = true;
+    const store = safeLocalStorage();
+    if (!store) return;
+    try {
+      if (inlineStockfishPersistedBase64) {
+        store.setItem(STOCKFISH_INLINE_STORAGE_KEY, inlineStockfishPersistedBase64);
+      } else {
+        store.removeItem(STOCKFISH_INLINE_STORAGE_KEY);
+      }
+    } catch (err) {
+      if (inlineStockfishPersistedBase64) {
+        console.warn('[CHESS] Failed to persist Stockfish payload.', err);
+      }
+    }
+  }
+
+  function clearPersistedInlineStockfishBase64() {
+    setPersistedInlineStockfishBase64(null);
+  }
+
   function loadStockfishDisabledFlag() {
     const store = safeLocalStorage();
     if (!store) return false;
@@ -78,6 +141,11 @@
   }
 
   let stockfishDisabled = loadStockfishDisabledFlag();
+  if (stockfishDisabled) {
+    stockfishDisabled = false;
+    persistStockfishDisabledFlag(false);
+    log('Cleared stored Stockfish disable flag to allow fresh engine attempts.');
+  }
 
   function isStockfishDisabled() {
     return stockfishDisabled === true;
@@ -244,10 +312,42 @@
   }
 
   function decodeBase64ToText(encoded) {
+    const normalized = normalizeBase64(encoded);
+    if (!normalized) return null;
     try {
-      return atob(encoded);
+      const binary = atob(normalized);
+      if (typeof TextDecoder === 'undefined') {
+        return binary;
+      }
+      const length = binary.length;
+      const bytes = new Uint8Array(length);
+      for (let i = 0; i < length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return new TextDecoder().decode(bytes);
     } catch (err) {
       console.warn('[CHESS] Failed to decode base64 Stockfish payload.', err);
+      return null;
+    }
+  }
+
+  function encodeTextToBase64(text) {
+    if (typeof text !== 'string') return null;
+    try {
+      if (typeof TextEncoder === 'undefined') {
+        return btoa(text);
+      }
+      const encoder = new TextEncoder();
+      const bytes = encoder.encode(text);
+      const chunk = 0x8000;
+      let binary = '';
+      for (let i = 0; i < bytes.length; i += chunk) {
+        const slice = bytes.subarray(i, i + chunk);
+        binary += String.fromCharCode.apply(null, slice);
+      }
+      return btoa(binary);
+    } catch (err) {
+      console.warn('[CHESS] Failed to encode Stockfish payload to base64.', err);
       return null;
     }
   }
@@ -338,6 +438,46 @@
     }
   }
 
+  function setSessionInlineStockfishBase64(base64Text) {
+    inlineStockfishSessionBase64 = base64Text ? normalizeBase64(base64Text) : null;
+  }
+
+  function clearSessionInlineStockfishBase64() {
+    inlineStockfishSessionBase64 = null;
+  }
+
+  function storeInlineStockfishBase64(base64Text, options = {}) {
+    const persist = options.persist !== false;
+    const normalized = normalizeBase64(base64Text);
+    if (!normalized) {
+      throw new Error('Empty base64 payload');
+    }
+    const decoded = decodeBase64ToText(normalized);
+    if (!decoded) {
+      throw new Error('Invalid base64 payload');
+    }
+    if (persist) {
+      setPersistedInlineStockfishBase64(normalized);
+      clearSessionInlineStockfishBase64();
+    } else {
+      setSessionInlineStockfishBase64(normalized);
+    }
+    return { persisted: persist, decodedBytes: decoded.length };
+  }
+
+  async function storeInlineStockfishFromUrl(url, options = {}) {
+    if (!url || typeof url !== 'string') {
+      throw new Error('URL is required');
+    }
+    const script = await fetchText(url.trim());
+    const base64 = encodeTextToBase64(script);
+    if (!base64) {
+      throw new Error('Failed to encode fetched Stockfish script to base64');
+    }
+    const result = storeInlineStockfishBase64(base64, options);
+    return { ...result, url: url.trim() };
+  }
+
   async function createStockfishWorker(url) {
     const script = await fetchText(url);
     if (/^\s*</.test(script)) {
@@ -348,37 +488,86 @@
 
   let stockfishPromise = window.__STOCKFISH_PROMISE || null;
 
+  let BUILTIN_ENGINE_SOURCE = null;
+
   async function ensureStockfishEngine() {
     if (window.__STOCKFISH_ENGINE_INSTANCE) return window.__STOCKFISH_ENGINE_INSTANCE;
     if (stockfishPromise) return stockfishPromise;
 
-    const defaultEngineUrls = [
-      'https://cdn.jsdelivr.net/npm/stockfish@16.1.1/dist/stockfish-nnue-16.js',
-      'https://cdn.jsdelivr.net/npm/stockfish@16/stockfish.js',
-      'https://cdn.jsdelivr.net/gh/official-stockfish/Stockfish/wasm/stockfish.js',
-      'https://cdn.jsdelivr.net/gh/niklasf/stockfish.wasm/stockfish.js',
-      'https://stockfish.online/stockfish.js',
-      'https://stockfish.online/js/stockfish.js',
-      'https://stockfishchess.org/js/stockfish.js',
-      'https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js'
-    ];
+    const defaultEngineUrls = [];
 
     const overrideUrls = Array.isArray(window.__CHESS_STOCKFISH_URLS)
       ? window.__CHESS_STOCKFISH_URLS.filter(url => typeof url === 'string' && url.trim().length > 0)
       : [];
 
     const inlinePayloads = [];
-    if (typeof window.__CHESS_STOCKFISH_INLINE === 'string') {
-      inlinePayloads.push(window.__CHESS_STOCKFISH_INLINE);
-    } else if (Array.isArray(window.__CHESS_STOCKFISH_INLINE)) {
-      for (const item of window.__CHESS_STOCKFISH_INLINE) {
-        if (typeof item === 'string' && item.trim().length > 0) inlinePayloads.push(item);
+    const inlineBase64Seen = new Set();
+    const pushInline = (code, label) => {
+      if (!code || typeof code !== 'string' || !code.trim()) return;
+      inlinePayloads.push({ code, label });
+    };
+
+    const persistedBase64 = loadPersistedInlineStockfishBase64();
+    const base64Candidates = [];
+    if (inlineStockfishSessionBase64) {
+      base64Candidates.push({
+        base64: inlineStockfishSessionBase64,
+        label: 'inline:session',
+        persisted: false
+      });
+    }
+    if (persistedBase64) {
+      base64Candidates.push({
+        base64: persistedBase64,
+        label: 'inline:stored',
+        persisted: true
+      });
+    }
+
+    for (const candidate of base64Candidates) {
+      const normalized = normalizeBase64(candidate.base64);
+      if (!normalized || inlineBase64Seen.has(normalized)) continue;
+      inlineBase64Seen.add(normalized);
+      const decoded = decodeBase64ToText(normalized);
+      if (decoded) {
+        log(`Using ${candidate.label} Stockfish payload (≈${estimateBase64DecodedSize(normalized)} bytes decoded).`);
+        pushInline(decoded, candidate.label);
+      } else if (candidate.persisted) {
+        console.warn('[CHESS] Stored Stockfish payload could not be decoded and was removed.');
+        clearPersistedInlineStockfishBase64();
+      } else {
+        console.warn('[CHESS] Session Stockfish payload could not be decoded and was ignored.');
+        clearSessionInlineStockfishBase64();
       }
+    }
+
+    if (typeof window.__CHESS_STOCKFISH_INLINE === 'string') {
+      pushInline(window.__CHESS_STOCKFISH_INLINE, 'inline:custom');
+    } else if (Array.isArray(window.__CHESS_STOCKFISH_INLINE)) {
+      window.__CHESS_STOCKFISH_INLINE.forEach((item, index) => {
+        if (typeof item === 'string' && item.trim().length > 0) {
+          pushInline(item, `inline:custom#${index + 1}`);
+        }
+      });
     }
 
     if (typeof window.__CHESS_STOCKFISH_INLINE_BASE64 === 'string') {
       const decoded = decodeBase64ToText(window.__CHESS_STOCKFISH_INLINE_BASE64.trim());
-      if (decoded) inlinePayloads.push(decoded);
+      if (decoded) pushInline(decoded, 'inline:custom-base64');
+    }
+
+    if (Array.isArray(window.__CHESS_STOCKFISH_INLINE_BASE64)) {
+      window.__CHESS_STOCKFISH_INLINE_BASE64.forEach((item, index) => {
+        if (typeof item === 'string' && item.trim().length > 0) {
+          const decoded = decodeBase64ToText(item.trim());
+          if (decoded) pushInline(decoded, `inline:custom-base64#${index + 1}`);
+        }
+      });
+    }
+
+    const builtinDisabled = window.__CHESS_DISABLE_BUILTIN_ENGINE === true;
+    if (!builtinDisabled) {
+      pushInline(getBuiltinEngineSource(), 'inline:builtin');
     }
 
     const stockfishForced = window.__CHESS_STOCKFISH_FORCE === true;
@@ -386,7 +575,7 @@
 
     const candidateUrls = Array.from(new Set([...overrideUrls, ...defaultEngineUrls]));
 
-    const retryCachedFailures = window.__CHESS_STOCKFISH_RETRY === true;
+    const retryCachedFailures = window.__CHESS_STOCKFISH_RETRY !== false;
     const filteredCandidateUrls = retryCachedFailures
       ? candidateUrls
       : candidateUrls.filter(url => !stockfishFailureCache[url]);
@@ -396,30 +585,42 @@
       if (skipped.length) {
         log('Skipping Stockfish URLs with cached failures:', skipped);
       }
+    } else {
+      const retried = candidateUrls.filter(url => stockfishFailureCache[url]);
+      if (retried.length) {
+        log('Retrying Stockfish URLs despite previous failures:', retried);
+      }
     }
 
     if (disableForSession && !inlinePayloads.length && overrideUrls.length === 0) {
       log('Stockfish disabled after repeated failures. Call __CHESS.enableStockfish() or set window.__CHESS_STOCKFISH_FORCE = true to retry.');
-      throw new Error('Stockfish disabled after repeated failures');
+      const error = new Error('Stockfish disabled after repeated failures');
+      error.silent = true;
+      throw error;
     }
 
     if (!filteredCandidateUrls.length && !inlinePayloads.length) {
-      throw new Error('All Stockfish URLs previously failed. Run __CHESS.clearStockfishFailures() or set window.__CHESS_STOCKFISH_RETRY = true to retry.');
+      const error = new Error('All Stockfish URLs previously failed. Run __CHESS.clearStockfishFailures() or set window.__CHESS_STOCKFISH_RETRY = true to retry.');
+      error.silent = true;
+      throw error;
     }
 
     stockfishPromise = window.__STOCKFISH_PROMISE = (async () => {
       if (!window.Worker) throw new Error('Web Workers not supported in this browser');
 
       for (const payload of inlinePayloads) {
+        const { code, label } = typeof payload === 'string'
+          ? { code: payload, label: 'inline:custom' }
+          : { code: payload.code, label: payload.label || 'inline:custom' };
         let worker;
         let blobUrl;
         try {
-          ({ worker, blobUrl } = createWorkerFromSource(payload));
-          const engine = new StockfishEngine(worker, 'inline:custom');
+          ({ worker, blobUrl } = createWorkerFromSource(code));
+          const engine = new StockfishEngine(worker, label);
           await engine.init();
           engine.blobUrl = blobUrl;
           window.__STOCKFISH_ENGINE_INSTANCE = engine;
-          window.__STOCKFISH_ENGINE_URL = 'inline:custom';
+          window.__STOCKFISH_ENGINE_URL = label;
           setStockfishDisabled(false);
           return engine;
         } catch (err) {
@@ -455,12 +656,13 @@
         }
       }
 
-      if (!stockfishForced && !inlinePayloads.length && attemptedUrls.length) {
-        setStockfishDisabled(true);
-        log('Disabled Stockfish attempts after repeated CDN failures. Use __CHESS.enableStockfish() to re-enable later.');
+      if (!stockfishForced && !inlinePayloads.length && attemptedUrls.length && !isStockfishDisabled()) {
+        log('Stockfish URL attempts failed; continuing with fallback search. Use __CHESS.disableStockfish() to skip future external tries.');
       }
 
-      throw new Error('Unable to load Stockfish engine from CDN');
+      const failure = new Error('Unable to load Stockfish engine from provided URLs');
+      failure.silent = filteredCandidateUrls.length === 0;
+      throw failure;
     })();
 
     stockfishPromise.catch(() => {
@@ -475,7 +677,7 @@
   function uciToSan(fen, uciMove) {
     if (!uciMove) return null;
     try {
-      const chess = new window.Chess(fen);
+      const chess = createChessInstance(fen);
       const from = uciMove.slice(0, 2);
       const to = uciMove.slice(2, 4);
       const promotion = uciMove.length > 4 ? uciMove.slice(4) : undefined;
@@ -499,7 +701,7 @@
 
   function pvToSanSequence(fen, pvMoves) {
     try {
-      const chess = new window.Chess(fen);
+      const chess = createChessInstance(fen);
       const sanMoves = [];
       for (const uci of pvMoves) {
         const from = uci.slice(0, 2);
@@ -861,7 +1063,7 @@
   }
 
   function rebuildGameFromTokens(tokenInfos) {
-    const game = new window.Chess();
+    const game = createChessInstance();
     const applied = [];
     const ignored = [];
 
@@ -879,6 +1081,7 @@
   }
 
   const pieceValues = { p: 1, n: 3.2, b: 3.3, r: 5.1, q: 9.5, k: 0 };
+  const KING_VALUE = 100;
 
   const pieceSquareTables = {
     p: [
@@ -1238,14 +1441,14 @@
       const originalTurn = segments[1];
       segments[1] = 'w';
       try {
-        const whiteGame = new window.Chess(segments.join(' '));
+        const whiteGame = createChessInstance(segments.join(' '));
         whiteMobility = whiteGame.moves().length;
       } catch (err) {
         whiteMobility = 0;
       }
       segments[1] = 'b';
       try {
-        const blackGame = new window.Chess(segments.join(' '));
+        const blackGame = createChessInstance(segments.join(' '));
         blackMobility = blackGame.moves().length;
       } catch (err) {
         blackMobility = 0;
@@ -1270,7 +1473,159 @@
     return `${move.from}-${move.to}-${move.promotion || ''}-${move.san}`;
   }
 
-  function movePriority(move, context, preferenceMap) {
+  function simpleMoveKey(move) {
+    return `${move.from}-${move.to}-${move.promotion || ''}`;
+  }
+
+  function createSearchMeta() {
+    return {
+      killerMoves: new Map(),
+      historyScores: new Map(),
+      orderingScores: new Map()
+    };
+  }
+
+  function killerMoveScore(searchMeta, ply, move) {
+    if (!searchMeta) return 0;
+    const list = searchMeta.killerMoves.get(ply);
+    if (!list) return 0;
+    const key = simpleMoveKey(move);
+    for (let i = 0; i < list.length; i++) {
+      if (list[i] === key) {
+        return 3 - i;
+      }
+    }
+    return 0;
+  }
+
+  function recordKillerMove(searchMeta, ply, move) {
+    if (!searchMeta) return;
+    if (move.captured || move.flags.includes('p')) return;
+    const key = simpleMoveKey(move);
+    let list = searchMeta.killerMoves.get(ply);
+    if (!list) {
+      list = [];
+      searchMeta.killerMoves.set(ply, list);
+    }
+    if (list.includes(key)) return;
+    list.unshift(key);
+    if (list.length > 2) list.length = 2;
+  }
+
+  function updateHistoryScore(searchMeta, move, depth) {
+    if (!searchMeta) return;
+    if (move.captured || move.flags.includes('p')) return;
+    const key = simpleMoveKey(move);
+    const current = searchMeta.historyScores.get(key) || 0;
+    searchMeta.historyScores.set(key, current + depth * depth);
+  }
+
+  function historyScore(searchMeta, move) {
+    if (!searchMeta) return 0;
+    const key = simpleMoveKey(move);
+    const value = searchMeta.historyScores.get(key) || 0;
+    return Math.min(3.5, value / 220);
+  }
+
+  function orderingMapFor(searchMeta, ply) {
+    if (!searchMeta) return null;
+    let map = searchMeta.orderingScores.get(ply);
+    if (!map) {
+      map = new Map();
+      searchMeta.orderingScores.set(ply, map);
+    } else {
+      map.clear();
+    }
+    return map;
+  }
+
+  function storeOrderingScore(orderMap, move, score) {
+    if (!orderMap) return;
+    orderMap.set(moveKey(move), score);
+  }
+
+  function lookupOrderingScore(searchMeta, ply, move) {
+    if (!searchMeta) return 0;
+    const map = searchMeta.orderingScores.get(ply);
+    if (!map) return 0;
+    return map.get(moveKey(move)) || 0;
+  }
+
+  function isForcingMove(move) {
+    return !!(move.captured || move.flags.includes('p') || /[+#]/.test(move.san));
+  }
+
+  function findKingSquare(game, color) {
+    const board = typeof game.board === 'function' ? game.board() : null;
+    if (!board) return null;
+    for (let row = 0; row < 8; row++) {
+      for (let col = 0; col < 8; col++) {
+        const piece = board[row]?.[col];
+        if (piece && piece.type === 'k' && piece.color === color) {
+          const file = String.fromCharCode(97 + col);
+          const rank = 8 - row;
+          return `${file}${rank}`;
+        }
+      }
+    }
+    return null;
+  }
+
+  function evaluateMoveConsequences(game, move) {
+    let penalty = 0;
+    let checkBonus = 0;
+    game.move(move);
+    try {
+      if (game.in_check()) {
+        checkBonus += 0.6;
+      }
+
+      const opponentMoves = game.moves({ verbose: true });
+      let minAttacker = Infinity;
+      let pawnThreat = false;
+      for (const reply of opponentMoves) {
+        if (reply.to === move.to) {
+          const value = pieceValues[reply.piece] ?? (reply.piece === 'k' ? KING_VALUE : 0);
+          if (value < minAttacker) minAttacker = value;
+          if (reply.piece === 'p') pawnThreat = true;
+        }
+      }
+
+      if (minAttacker !== Infinity) {
+        let defenders = 0;
+        try {
+          const fenParts = game.fen().split(' ');
+          fenParts[1] = move.color;
+          const defenderGame = createChessInstance(fenParts.join(' '));
+          defenders = defenderGame.moves({ verbose: true }).filter(m => m.to === move.to).length;
+        } catch (err) {
+          defenders = 0;
+        }
+
+        const movedValue = pieceValues[move.piece] ?? (move.piece === 'k' ? KING_VALUE : 0);
+        const attackValue = minAttacker;
+        if (attackValue < movedValue - 0.05) {
+          const diff = movedValue - attackValue;
+          const modifier = defenders > 0 ? 0.55 : 1.15;
+          penalty += diff * modifier;
+        }
+        if (pawnThreat && movedValue > 1.5) {
+          penalty += defenders > 0 ? 0.25 : 0.6;
+        }
+      }
+
+      const kingSquare = findKingSquare(game, move.color);
+      if (kingSquare) {
+        const underAttack = opponentMoves.some(reply => reply.to === kingSquare);
+        if (underAttack) penalty += 0.9;
+      }
+    } finally {
+      game.undo();
+    }
+    return { penalty, checkBonus };
+  }
+
+  function movePriority(game, move, context, preferenceMap, searchMeta, ply) {
     let score = 0;
     if (preferenceMap) {
       const pref = preferenceMap.get(moveKey(move));
@@ -1278,6 +1633,12 @@
         score += 60 - pref;
       }
     }
+
+    if (searchMeta) {
+      score += killerMoveScore(searchMeta, ply, move);
+      score += historyScore(searchMeta, move);
+    }
+
     if (move.captured) {
       const captureWeights = { p: 1, n: 2, b: 2, r: 3, q: 4, k: 6 };
       score += 4 + (captureWeights[move.captured] || 0);
@@ -1285,42 +1646,54 @@
     if (move.flags.includes('c')) score += 1.5;
     if (/[+#]/.test(move.san)) score += move.san.includes('#') ? 5 : 2.5;
     if (move.flags.includes('p')) score += 6;
-    if (move.flags.includes('k') || move.flags.includes('q')) score += 3;
+    if (move.flags.includes('k') || move.flags.includes('q')) score += 3.2;
 
     const openingPhase = context ? context.moveCount < 16 : false;
     const veryEarly = context ? context.moveCount < 8 : false;
 
     if ((move.piece === 'n' || move.piece === 'b') && minorPieceStartSquares.has(move.from)) {
-      score += openingPhase ? 1.4 : 0.4;
-      if (coreCenterSquares.has(move.to)) score += 0.6;
-      else if (extendedCenterSquares.has(move.to)) score += 0.4;
+      score += openingPhase ? 1.6 : 0.5;
+      if (coreCenterSquares.has(move.to)) score += 0.65;
+      else if (extendedCenterSquares.has(move.to)) score += 0.45;
     }
 
     if (move.piece === 'p') {
-      if (coreCenterSquares.has(move.to)) score += 0.6;
-      else if (extendedCenterSquares.has(move.to)) score += 0.3;
+      if (coreCenterSquares.has(move.to)) score += 0.7;
+      else if (extendedCenterSquares.has(move.to)) score += 0.35;
 
       if (flankFiles.has(move.from[0])) {
-        score -= openingPhase ? 0.9 : 0.2;
-        if (veryEarly) score -= 0.6;
+        score -= openingPhase ? 1.1 : 0.3;
+        if (veryEarly) score -= 0.7;
       }
     } else if (coreCenterSquares.has(move.to)) {
-      score += 0.4;
+      score += 0.45;
     } else if (extendedCenterSquares.has(move.to)) {
-      score += 0.25;
+      score += 0.27;
     }
 
     if (move.san === 'O-O' || move.san === 'O-O-O') {
-      score += 3.5;
+      score += 3.8;
     }
+
+    const consequence = evaluateMoveConsequences(game, move);
+    score += consequence.checkBonus;
+    score -= consequence.penalty;
 
     return score;
   }
 
-  function orderedMoves(game, context, preferenceMap) {
-    return game
-      .moves({ verbose: true })
-      .sort((a, b) => movePriority(b, context, preferenceMap) - movePriority(a, context, preferenceMap));
+  function orderedMoves(game, context, preferenceMap, searchMeta, ply = 0, captureOnly = false) {
+    const moves = game.moves({ verbose: true });
+    const orderMap = orderingMapFor(searchMeta, ply);
+    const scored = [];
+    for (const move of moves) {
+      if (captureOnly && !isForcingMove(move)) continue;
+      const value = movePriority(game, move, context, preferenceMap, searchMeta, ply);
+      storeOrderingScore(orderMap, move, value);
+      scored.push({ move, value });
+    }
+    scored.sort((a, b) => b.value - a.value);
+    return scored.map(entry => entry.move);
   }
 
   function evaluateTerminalState(game, perspective, plyCount, context) {
@@ -1334,8 +1707,8 @@
     return evaluateForPerspective(game, perspective, context);
   }
 
-  function quiescence(game, alpha, beta, perspective, plyCount, stats, context, deadline, nowFn, limit = 6) {
-    if (deadline && nowFn && nowFn() > deadline) {
+  function quiescence(game, alpha, beta, perspective, plyCount, stats, context, deadline, nowFn, searchMeta, limit = 6, shouldStop) {
+    if ((shouldStop && shouldStop()) || (deadline && nowFn && nowFn() > deadline)) {
       stats.timeouts = (stats.timeouts || 0) + 1;
       return evaluateForPerspective(game, perspective, context);
     }
@@ -1345,10 +1718,10 @@
     if (standPat > alpha) alpha = standPat;
     if (limit <= 0) return standPat;
 
-    const captureMoves = orderedMoves(game, context).filter(move => move.captured || move.flags.includes('p') || /[+#]/.test(move.san));
+    const captureMoves = orderedMoves(game, context, null, searchMeta, plyCount, true);
     for (const move of captureMoves) {
       game.move(move);
-      const score = -quiescence(game, -beta, -alpha, perspective, plyCount + 1, stats, context, deadline, nowFn, limit - 1);
+      const score = -quiescence(game, -beta, -alpha, perspective, plyCount + 1, stats, context, deadline, nowFn, searchMeta, limit - 1, shouldStop);
       game.undo();
       if (score >= beta) return beta;
       if (score > alpha) alpha = score;
@@ -1356,8 +1729,8 @@
     return alpha;
   }
 
-  function negamax(game, depth, alpha, beta, perspective, table, plyCount, stats, context, deadline, nowFn) {
-    if (deadline && nowFn && nowFn() > deadline) {
+  function negamax(game, depth, alpha, beta, perspective, table, plyCount, stats, context, deadline, nowFn, searchMeta, shouldStop) {
+    if ((shouldStop && shouldStop()) || (deadline && nowFn && nowFn() > deadline)) {
       stats.timeouts = (stats.timeouts || 0) + 1;
       return evaluateForPerspective(game, perspective, context);
     }
@@ -1388,28 +1761,47 @@
     }
 
     if (depth <= 0) {
-      return quiescence(game, alpha, beta, perspective, plyCount, stats, context, deadline, nowFn);
+      return quiescence(game, alpha, beta, perspective, plyCount, stats, context, deadline, nowFn, searchMeta, 6, shouldStop);
     }
 
-    const moves = orderedMoves(game, context);
+    const moves = orderedMoves(game, context, null, searchMeta, plyCount);
     const limit = depth >= 3 ? Math.min(moves.length, 14) : Math.min(moves.length, 18);
     let bestValue = -Infinity;
     let bestFlag = 'upper';
+    let bestChild = null;
 
     for (let i = 0; i < limit; i++) {
       const move = moves[i];
       game.move(move);
-      const score = -negamax(game, depth - 1, -beta, -alpha, perspective, table, plyCount + 1, stats, context, deadline, nowFn);
+      let nextDepth = depth - 1;
+      const givesCheck = game.in_check();
+      if (givesCheck && nextDepth >= 0) {
+        nextDepth = Math.min(depth, nextDepth + 1);
+      }
+      if (!isForcingMove(move) && depth >= 3 && i > 5 && nextDepth > 1) {
+        nextDepth -= 1;
+      }
+
+      let score;
+      if (game.in_checkmate()) {
+        score = evaluateTerminalState(game, perspective, plyCount + 1, context);
+      } else {
+        score = -negamax(game, nextDepth, -beta, -alpha, perspective, table, plyCount + 1, stats, context, deadline, nowFn, searchMeta, shouldStop);
+      }
       game.undo();
 
       if (score > bestValue) {
         bestValue = score;
+        bestChild = { from: move.from, to: move.to, promotion: move.promotion || null };
       }
       if (score > alpha) {
         alpha = score;
         bestFlag = 'exact';
+        updateHistoryScore(searchMeta, move, depth);
       }
       if (alpha >= beta) {
+        recordKillerMove(searchMeta, plyCount, move);
+        updateHistoryScore(searchMeta, move, depth);
         bestFlag = 'lower';
         break;
       }
@@ -1420,7 +1812,7 @@
       bestFlag = 'exact';
     }
 
-    table.set(key, { depth, value: bestValue, flag: bestFlag });
+    table.set(key, { depth, value: bestValue, flag: bestFlag, best: bestChild });
     return bestValue;
   }
 
@@ -1436,16 +1828,51 @@
     return Math.max(3, Math.min(depth, 7));
   }
 
-  function analyzeFallback(game) {
+  function principalVariationFromTable(fen, table, maxLength = 12) {
+    const pv = [];
+    if (!fen) return pv;
+    let chess;
+    try {
+      chess = createChessInstance(fen);
+    } catch (err) {
+      return pv;
+    }
+    const seen = new Set();
+    for (let depth = 0; depth < maxLength; depth++) {
+      const key = chess.fen();
+      if (seen.has(key)) break;
+      seen.add(key);
+      const entry = table.get(key);
+      if (!entry || !entry.best) break;
+      const move = chess.move({
+        from: entry.best.from,
+        to: entry.best.to,
+        promotion: entry.best.promotion || undefined
+      });
+      if (!move) break;
+      pv.push(move);
+      if (chess.game_over()) break;
+    }
+    return pv;
+  }
+
+  function analyzeFallback(game, options = {}) {
     const evalContext = createEvaluationContext(game);
-    const initialMoves = orderedMoves(game, evalContext);
+    const searchMeta = createSearchMeta();
+    const initialMoves = orderedMoves(game, evalContext, null, searchMeta, 0);
     if (!initialMoves.length) {
       return { best: null, details: [], depth: 0, considered: 0, elapsed: 0, aborted: false };
     }
 
     const perspective = game.turn();
     const moveCount = evalContext.moveCount;
-    const targetDepth = chooseFallbackDepth(moveCount, initialMoves.length);
+    const preferredDepth = typeof options.depth === 'number' ? Math.max(1, Math.floor(options.depth)) : null;
+    const depthCap = typeof options.maxDepth === 'number' ? Math.max(1, Math.floor(options.maxDepth)) : null;
+    const depthFloor = typeof options.minDepth === 'number' ? Math.max(1, Math.floor(options.minDepth)) : null;
+    let targetDepth = preferredDepth ?? chooseFallbackDepth(moveCount, initialMoves.length);
+    if (depthCap !== null) targetDepth = Math.min(targetDepth, depthCap);
+    if (depthFloor !== null) targetDepth = Math.max(targetDepth, depthFloor);
+
     const table = new Map();
     const stats = { nodes: 0, timeouts: 0 };
     const preferenceMap = new Map();
@@ -1453,11 +1880,14 @@
     const nowFn = typeof performance !== 'undefined' && typeof performance.now === 'function'
       ? () => performance.now()
       : () => Date.now();
-    const timeBudget = typeof window.__CHESS_FALLBACK_TIME === 'number'
-      ? Math.max(250, window.__CHESS_FALLBACK_TIME)
-      : 1700;
+    const timeBudget = typeof options.timeBudget === 'number'
+      ? Math.max(0, options.timeBudget)
+      : (typeof window !== 'undefined' && typeof window.__CHESS_FALLBACK_TIME === 'number'
+        ? Math.max(250, window.__CHESS_FALLBACK_TIME)
+        : 1700);
     const startTime = nowFn();
-    const deadline = startTime + timeBudget;
+    const deadline = Number.isFinite(timeBudget) && timeBudget > 0 ? startTime + timeBudget : null;
+    const shouldStop = typeof options.shouldStop === 'function' ? options.shouldStop : null;
 
     let reachedDepth = 0;
     let aborted = false;
@@ -1465,14 +1895,18 @@
     let bestSummary = null;
 
     for (let depth = 1; depth <= targetDepth; depth++) {
-      const candidateMoves = orderedMoves(game, evalContext, preferenceMap);
+      if (shouldStop && shouldStop()) {
+        aborted = true;
+        break;
+      }
+      const candidateMoves = orderedMoves(game, evalContext, preferenceMap, searchMeta, 0);
       const limit = Math.min(candidateMoves.length, depth >= 4 ? 20 : 24);
       const iteration = [];
       let alpha = -Infinity;
       let beta = Infinity;
 
       for (let i = 0; i < limit; i++) {
-        if (nowFn() > deadline) {
+        if ((shouldStop && shouldStop()) || (deadline && nowFn() > deadline)) {
           aborted = true;
           break;
         }
@@ -1482,16 +1916,16 @@
         if (game.in_checkmate()) {
           score = evaluateTerminalState(game, perspective, 1, evalContext);
         } else {
-          score = -negamax(game, depth - 1, -beta, -alpha, perspective, table, 1, stats, evalContext, deadline, nowFn);
+          score = -negamax(game, depth - 1, -beta, -alpha, perspective, table, 1, stats, evalContext, deadline, nowFn, searchMeta, shouldStop);
         }
-        const checkBonus = game.in_check() ? 0.2 : 0;
+        const checkBonus = game.in_check() ? 0.25 : 0;
         game.undo();
 
-        const priorityBoost = movePriority(move, evalContext) * 0.04;
-        const normalized = score + checkBonus + priorityBoost;
+        const orderBoost = lookupOrderingScore(searchMeta, 0, move) * 0.02;
+        const normalized = score + checkBonus + orderBoost;
         iteration.push({ move, rawScore: score, score: normalized });
         if (score > alpha) alpha = score;
-        if (nowFn() > deadline) {
+        if ((shouldStop && shouldStop()) || (deadline && nowFn() > deadline)) {
           aborted = true;
           break;
         }
@@ -1518,6 +1952,27 @@
 
     const elapsed = nowFn() - startTime;
 
+    const rootFen = game.fen();
+    const detailedResults = finalResults.map(entry => {
+      const clone = createChessInstance(rootFen);
+      const pvMoves = [];
+      const first = clone.move({ from: entry.move.from, to: entry.move.to, promotion: entry.move.promotion });
+      if (first) {
+        pvMoves.push(first);
+        const continuation = principalVariationFromTable(clone.fen(), table, targetDepth + 4);
+        pvMoves.push(...continuation);
+      }
+      return {
+        move: entry.move,
+        score: entry.score,
+        pv: pvMoves,
+        pvSan: pvMoves.map(m => m.san)
+      };
+    });
+
+    finalResults = detailedResults;
+    bestSummary = finalResults[0] || null;
+
     return {
       best: bestSummary,
       details: finalResults,
@@ -1527,6 +1982,279 @@
       elapsed,
       timeouts: stats.timeouts || 0
     };
+  }
+
+  function sanitizeFunctionForWorker(fn) {
+    return fn
+      .toString()
+      .replace(/window\./g, '')
+      .replace(/\bcreateChessInstance\(/g, 'createChessInstance(');
+  }
+
+  function buildBuiltinEngineSource() {
+    const jsonPieceValues = JSON.stringify(pieceValues);
+    const jsonPieceSquareTables = JSON.stringify(pieceSquareTables);
+    const jsonKingSquareTables = JSON.stringify(kingSquareTables);
+    const jsonCoreCenter = JSON.stringify(Array.from(coreCenterSquares));
+    const jsonExtendedCenter = JSON.stringify(Array.from(extendedCenterSquares));
+    const jsonMinorStarts = JSON.stringify(Array.from(minorPieceStartSquares));
+    const jsonFlankFiles = JSON.stringify(Array.from(flankFiles));
+
+    const functionSources = [
+      createEvaluationContext,
+      pieceSquareValue,
+      evaluatePosition,
+      evaluateForPerspective,
+      moveKey,
+      simpleMoveKey,
+      createSearchMeta,
+      killerMoveScore,
+      recordKillerMove,
+      updateHistoryScore,
+      historyScore,
+      orderingMapFor,
+      storeOrderingScore,
+      lookupOrderingScore,
+      isForcingMove,
+      findKingSquare,
+      evaluateMoveConsequences,
+      movePriority,
+      orderedMoves,
+      evaluateTerminalState,
+      quiescence,
+      negamax,
+      chooseFallbackDepth,
+      principalVariationFromTable,
+      analyzeFallback
+    ].map(sanitizeFunctionForWorker);
+
+    return String.raw`(function() {
+      'use strict';
+      const ctx = self;
+      function send(line) { ctx.postMessage(line); }
+      try {
+        importScripts('https://cdnjs.cloudflare.com/ajax/libs/chess.js/0.10.2/chess.min.js');
+      } catch (err) {
+        send('info string Failed to load chess.js: ' + (err && err.message ? err.message : err));
+        send('uciok');
+        send('readyok');
+        return;
+      }
+      const Chess = self.Chess;
+      if (!Chess) {
+        send('info string Chess.js unavailable in worker');
+        send('uciok');
+        send('readyok');
+        return;
+      }
+
+      const pieceValues = ${jsonPieceValues};
+      const pieceSquareTables = ${jsonPieceSquareTables};
+      const kingSquareTables = ${jsonKingSquareTables};
+      const coreCenterSquares = new Set(${jsonCoreCenter});
+      const extendedCenterSquares = new Set(${jsonExtendedCenter});
+      const minorPieceStartSquares = new Set(${jsonMinorStarts});
+      const flankFiles = new Set(${jsonFlankFiles});
+
+      function createChessInstance(fen) {
+        return typeof fen === 'string' && fen ? new Chess(fen) : new Chess();
+      }
+
+${functionSources.join('\n\n')}
+
+      function movesToUci(list) {
+        return list.map(move => move.from + move.to + (move.promotion ? move.promotion : ''));
+      }
+
+      function analyzeFen(fen, options) {
+        const game = createChessInstance(fen);
+        return analyzeFallback(game, options);
+      }
+
+      let currentFen = createChessInstance().fen();
+      let multiPv = 3;
+      let defaultMoveTime = 1500;
+      let forcedDepth = null;
+      let searchId = 0;
+      let stopRequested = false;
+
+      function applyPosition(tokens) {
+        if (tokens.length < 2) {
+          currentFen = createChessInstance().fen();
+          return;
+        }
+        let fen = null;
+        let movesIndex = tokens.indexOf('moves');
+        if (tokens[1] === 'startpos') {
+          fen = createChessInstance().fen();
+        } else if (tokens[1] === 'fen') {
+          const fenTokens = movesIndex === -1 ? tokens.slice(2) : tokens.slice(2, movesIndex);
+          fen = fenTokens.join(' ');
+        }
+        if (!fen) {
+          fen = createChessInstance().fen();
+        }
+        let chess;
+        try {
+          chess = createChessInstance(fen);
+        } catch (err) {
+          send('info string Invalid FEN supplied to built-in engine');
+          chess = createChessInstance();
+        }
+        if (movesIndex !== -1) {
+          const moveTokens = tokens.slice(movesIndex + 1);
+          for (const token of moveTokens) {
+            if (!token) continue;
+            const from = token.slice(0, 2);
+            const to = token.slice(2, 4);
+            const promotion = token.length > 4 ? token.slice(4, 5) : undefined;
+            const result = chess.move({ from, to, promotion });
+            if (!result) break;
+          }
+        }
+        currentFen = chess.fen();
+      }
+
+      function parseGo(tokens) {
+        const result = {};
+        for (let i = 1; i < tokens.length; i++) {
+          const token = tokens[i];
+          if (token === 'depth' && i + 1 < tokens.length) {
+            const value = parseInt(tokens[++i], 10);
+            if (Number.isFinite(value)) result.depth = value;
+          } else if (token === 'movetime' && i + 1 < tokens.length) {
+            const value = parseInt(tokens[++i], 10);
+            if (Number.isFinite(value)) result.movetime = value;
+          } else if (token === 'wtime' && i + 1 < tokens.length) {
+            const value = parseInt(tokens[++i], 10);
+            if (Number.isFinite(value)) result.wtime = value;
+          } else if (token === 'btime' && i + 1 < tokens.length) {
+            const value = parseInt(tokens[++i], 10);
+            if (Number.isFinite(value)) result.btime = value;
+          }
+        }
+        return result;
+      }
+
+      function effectiveMoveTime(params, activeColor) {
+        if (Number.isFinite(params.movetime) && params.movetime > 0) return params.movetime;
+        if (activeColor === 'w' && Number.isFinite(params.wtime)) return Math.max(100, params.wtime / 30);
+        if (activeColor === 'b' && Number.isFinite(params.btime)) return Math.max(100, params.btime / 30);
+        return defaultMoveTime;
+      }
+
+      function startSearch(params) {
+        const id = ++searchId;
+        stopRequested = false;
+        const fen = currentFen;
+        const activeColor = fen.split(' ')[1] || 'w';
+        const timeBudget = effectiveMoveTime(params, activeColor);
+        const depth = Number.isFinite(params.depth) ? params.depth : forcedDepth;
+
+        const analysis = analyzeFen(fen, {
+          timeBudget,
+          depth,
+          maxDepth: depth,
+          shouldStop: () => stopRequested
+        });
+
+        if (id !== searchId || stopRequested) {
+          return;
+        }
+
+        const lines = analysis.details.slice(0, Math.max(1, multiPv));
+        if (!lines.length) {
+          send('bestmove 0000');
+          return;
+        }
+
+        lines.forEach((entry, index) => {
+          const pvList = entry.pv && entry.pv.length ? entry.pv : [entry.move];
+          const uciPv = movesToUci(pvList);
+          const cpScore = Math.round((entry.score || 0) * 100);
+          send(
+            'info depth ' + analysis.depth +
+            ' multipv ' + (index + 1) +
+            ' score cp ' + cpScore +
+            ' nodes ' + (analysis.considered || 0) +
+            ' pv ' + uciPv.join(' ')
+          );
+        });
+
+        const best = lines[0];
+        const bestMove = best.move.from + best.move.to + (best.move.promotion ? best.move.promotion : '');
+        const ponderMove = best.pv && best.pv.length > 1
+          ? best.pv[1].from + best.pv[1].to + (best.pv[1].promotion ? best.pv[1].promotion : '')
+          : null;
+        send('bestmove ' + bestMove + (ponderMove ? ' ponder ' + ponderMove : ''));
+      }
+
+      self.onmessage = function(event) {
+        const raw = event && event.data;
+        if (typeof raw !== 'string') return;
+        const line = raw.trim();
+        if (!line) return;
+        const tokens = line.split(/\s+/);
+        const command = tokens[0];
+
+        if (command === 'uci') {
+          send('id name ChessHelper Built-in Engine');
+          send('id author SanFen Helper');
+          send('uciok');
+          return;
+        }
+        if (command === 'isready') {
+          send('readyok');
+          return;
+        }
+        if (command === 'ucinewgame') {
+          currentFen = createChessInstance().fen();
+          stopRequested = false;
+          return;
+        }
+        if (command === 'position') {
+          applyPosition(tokens);
+          return;
+        }
+        if (command === 'setoption') {
+          const nameIndex = tokens.indexOf('name');
+          const valueIndex = tokens.indexOf('value');
+          if (nameIndex !== -1) {
+            const name = tokens.slice(nameIndex + 1, valueIndex === -1 ? undefined : valueIndex).join(' ').toLowerCase();
+            const value = valueIndex !== -1 ? tokens.slice(valueIndex + 1).join(' ') : '';
+            if (name === 'multipv') {
+              const numeric = parseInt(value, 10);
+              if (Number.isFinite(numeric) && numeric >= 1) multiPv = Math.max(1, numeric);
+            } else if (name === 'movetime' || name === 'builtintime') {
+              const numeric = parseInt(value, 10);
+              if (Number.isFinite(numeric) && numeric > 0) defaultMoveTime = numeric;
+            } else if (name === 'depth' || name === 'builtindepth') {
+              const numeric = parseInt(value, 10);
+              forcedDepth = Number.isFinite(numeric) && numeric > 0 ? numeric : null;
+            }
+          }
+          return;
+        }
+        if (command === 'go') {
+          startSearch(parseGo(tokens));
+          return;
+        }
+        if (command === 'stop') {
+          stopRequested = true;
+          return;
+        }
+        if (command === 'quit') {
+          try { self.close(); } catch (err) { /* ignore */ }
+        }
+      };
+    })();`;
+  }
+
+  function getBuiltinEngineSource() {
+    if (!BUILTIN_ENGINE_SOURCE) {
+      BUILTIN_ENGINE_SOURCE = buildBuiltinEngineSource();
+    }
+    return BUILTIN_ENGINE_SOURCE;
   }
 
   const chessLoaded = await ensureChessJS();
@@ -1594,7 +2322,9 @@
       engineAnalysis = await analyzeWithStockfish(engine, game);
     } catch (err) {
       engineError = err;
-      console.warn('[CHESS] Stockfish analysis unavailable.', err);
+      if (!err || !err.silent) {
+        console.warn('[CHESS] Stockfish analysis unavailable.', err);
+      }
     }
   }
 
@@ -1658,16 +2388,21 @@
     const suggestionsSan = topMoves.map(entry => entry.move.san);
     const suggestionsDetail = topMoves.map(entry => {
       const scoreValue = typeof entry.score === 'number' ? entry.score : 0;
-      return `${entry.move.san}  ${entry.move.from.toUpperCase()}->${entry.move.to.toUpperCase()} (score≈${scoreValue.toFixed(2)})`;
+      const continuation = Array.isArray(entry.pvSan) ? entry.pvSan.slice(1) : [];
+      const pvTail = continuation.length ? ` → ${continuation.join(' ')}` : '';
+      return `${entry.move.san}  ${entry.move.from.toUpperCase()}->${entry.move.to.toUpperCase()} (score≈${scoreValue.toFixed(2)})${pvTail}`;
     });
     fallbackDetails = topMoves.map(entry => {
       const scoreValue = typeof entry.score === 'number' ? entry.score : 0;
+      const continuation = Array.isArray(entry.pvSan) ? entry.pvSan.slice(1) : [];
+      const pvTail = continuation.length ? ` → ${continuation.join(' ')}` : '';
       return {
         san: entry.move.san,
         from: entry.move.from.toUpperCase(),
         to: entry.move.to.toUpperCase(),
         score: scoreValue,
-        detail: `${entry.move.san}  ${entry.move.from.toUpperCase()}->${entry.move.to.toUpperCase()} (score≈${scoreValue.toFixed(2)})`
+        detail: `${entry.move.san}  ${entry.move.from.toUpperCase()}->${entry.move.to.toUpperCase()} (score≈${scoreValue.toFixed(2)})${pvTail}`,
+        pvSan: Array.isArray(entry.pvSan) ? entry.pvSan.slice() : []
       };
     });
 
@@ -1683,21 +2418,27 @@
     log('FALLBACK SEARCH:', ...fallbackLog);
 
     if (fallback.best) {
-      const { move, score } = fallback.best;
+      const { move, score, pvSan } = fallback.best;
       const scoreValue = typeof score === 'number' ? score : 0;
+      const continuation = Array.isArray(pvSan) ? pvSan.slice(1) : [];
+      const pvTail = continuation.length ? ` → ${continuation.join(' ')}` : '';
       bestRecommendation = `${move.san} (${move.from.toUpperCase()}->${move.to.toUpperCase()})`;
-      log('RECOMMENDATION:', `${move.san}  ${move.from.toUpperCase()}->${move.to.toUpperCase()} (score≈${scoreValue.toFixed(2)})`);
+      log('RECOMMENDATION:', `${move.san}  ${move.from.toUpperCase()}->${move.to.toUpperCase()} (score≈${scoreValue.toFixed(2)})${pvTail}`);
     } else {
       log('RECOMMENDATION: (no legal moves found)');
     }
   }
 
   if (engineError) {
-    log('ENGINE ERROR:', engineError.message || engineError);
+    if (engineError.silent) {
+      log('ENGINE STATUS: Stockfish unavailable, using built-in search. (__CHESS.enableStockfish() to retry)');
+    } else {
+      log('ENGINE ERROR:', engineError.message || engineError);
+    }
   }
 
   window.__CHESS = {
-    version: 'helper-15',
+    version: 'helper-18',
     moveListFound: () => moveListFound,
     fen: () => game.fen(),
     turn: () => game.turn(),
@@ -1728,6 +2469,43 @@
     fallback: () => (!engineAnalysis && fallbackMeta) ? { ...fallbackMeta } : null,
     inferred: () => inferredMoves.map(m => ({ san: m.san, matched: m.matched })),
     stockfishFailures: () => stockfishFailureEntries().map(entry => ({ ...entry })),
+    stockfishInfo: () => {
+      const persisted = loadPersistedInlineStockfishBase64();
+      return {
+        engineUrl: window.__STOCKFISH_ENGINE_URL || null,
+        storedInline: !!persisted,
+        storedInlineBytes: estimateBase64DecodedSize(persisted),
+        sessionInline: !!inlineStockfishSessionBase64,
+        sessionInlineBytes: estimateBase64DecodedSize(inlineStockfishSessionBase64),
+        disabled: isStockfishDisabled(),
+        failures: stockfishFailureEntries().map(entry => ({ ...entry }))
+      };
+    },
+    storeStockfishInline: (base64, options) => {
+      try {
+        const result = storeInlineStockfishBase64(base64, options || {});
+        log(`Stored inline Stockfish payload (${result.persisted ? 'persisted' : 'session-only'}; decoded≈${result.decodedBytes} bytes).`);
+        return result;
+      } catch (err) {
+        console.error('[CHESS] Failed to store inline Stockfish payload.', err);
+        throw err;
+      }
+    },
+    storeStockfishFromUrl: async (url, options) => {
+      try {
+        const result = await storeInlineStockfishFromUrl(url, options || {});
+        log(`Fetched and stored Stockfish from ${result.url} (${result.persisted ? 'persisted' : 'session-only'}; decoded≈${result.decodedBytes} bytes).`);
+        return result;
+      } catch (err) {
+        console.error('[CHESS] Failed to fetch or store Stockfish from URL.', err);
+        throw err;
+      }
+    },
+    clearStoredStockfishInline: () => {
+      clearSessionInlineStockfishBase64();
+      clearPersistedInlineStockfishBase64();
+      log('Cleared stored inline Stockfish payloads.');
+    },
     stockfishDisabled: () => isStockfishDisabled(),
     disableStockfish: () => {
       setStockfishDisabled(true);
@@ -1743,7 +2521,7 @@
     },
     trySan: (san) => {
       try {
-        const clone = new window.Chess(game.fen());
+        const clone = createChessInstance(game.fen());
         const mv = clone.move(san, { sloppy: true });
         if (!mv) return console.warn('[CHESS] illegal SAN', san);
         console.log('[CHESS] after', san, 'FEN=', clone.fen());
@@ -1753,7 +2531,7 @@
     },
     tryFromTo: (from, to, promotion) => {
       try {
-        const clone = new window.Chess(game.fen());
+        const clone = createChessInstance(game.fen());
         const mv = clone.move({ from: from.toLowerCase(), to: to.toLowerCase(), promotion: promotion || 'q' });
         if (!mv) return console.warn('[CHESS] illegal from->to', from, to);
         console.log('[CHESS] after', `${from.toUpperCase()}->${to.toUpperCase()} (${mv.san})`, 'FEN=', clone.fen());

@@ -1,12 +1,12 @@
 # SanFen Chess Helper
 
-This repository contains a single-file helper (`chess-helper.js`) that you can paste into the browser console while playing against the chess.com computer. The helper rebuilds the live position from the move list, prints a concise snapshot of the game, and now drives its move recommendation with the Stockfish engine for significantly stronger suggestions. When Stockfish cannot be reached, the helper falls back to a substantially upgraded built-in search that performs iterative deepening (up to seven plies when the position allows), adds quiescence for tactical stability, and scores positions with development, king-safety, pawn-structure, and mobility heuristics so the suggestions remain principled. You can inspect or explore the position further through the exposed helper utilities.
+This repository contains a single-file helper (`chess-helper.js`) that you can paste into the browser console while playing against the chess.com computer. The helper rebuilds the live position from the move list, prints a concise snapshot of the game, and now lets you **embed a permanent Stockfish build locally**. Provide a base64 copy of the official Stockfish WASM worker (the JavaScript file that loads the accompanying `stockfish.wasm`, often named `stockfish.wasm.js`) once, and the helper will launch that engine directly from `localStorage` on every run—no more flaky CDN lookups or CORS surprises. When no stored payload is available, the script still falls back to its self-contained search engine so you always receive principled suggestions. You can inspect or explore the position further through the exposed helper utilities.
 
 ## Prerequisites
 - Use Google Chrome, Firefox, or another modern browser that exposes the developer console (F12 or Ctrl/Cmd+Shift+I).
 - Open a game against the chess.com computer at <https://www.chess.com/play/computer>.
 - (Optional) Enable the move list panel in the UI. The helper now copes with the very first move even if the list is hidden, but opening it ensures consistent parsing.
-- Permit outbound network requests to CDN providers (jsDelivr, stockfish.online, stockfishchess.org, cdnjs, or any custom mirror you supply). When a URL fails, the helper caches that result and skips it for the next seven days to avoid spamming the console; you can override or clear the cache at any time (see “Cached CDN failures and retries”).
+- Permit outbound network requests to whichever Stockfish URLs you configure (if any). If you rely solely on the embedded worker or an inline payload, no external access is required.
 
 ## Running the helper
 1. Start or resume your game against the computer. If you have not yet moved, the helper will assume the starting position and log a reminder that the move list is not yet available.
@@ -33,17 +33,32 @@ The helper prints several diagnostic sections in order:
 - **SAN COUNT / IGNORED TOKENS / INFERRED TOKENS** – How many moves were reconstructed, which tokens were skipped, and any tokens that required heuristic matching.
 - **LAST MOVE / FEN / RECENT** – Snapshot of the reconstructed game state.
 - **LEGAL (SAN) / LEGAL (from->to)** – All legal moves in SAN and algebraic coordinate form for the side to move.
-- **ENGINE SOURCE** – The CDN URL that successfully loaded Stockfish (or `inline:custom` when you provide the worker code). If loading fails, the helper falls back to its built-in multi-ply search heuristics.
-- **ENGINE SUGGESTIONS** – MultiPV lines reported by Stockfish with evaluation scores and search depth.
-- **ENGINE RECOMMENDATION** – The best move returned by Stockfish, including the analyzed depth. When the engine is unavailable the helper falls back to the heuristic **SIMPLE SUGGESTIONS** and **RECOMMENDATION** logs so you still receive guidance.
+- **ENGINE SOURCE** – Indicates which engine produced the current analysis. `inline:builtin` means the embedded worker handled the search locally, `inline:custom` refers to your own inline payload, and full URLs identify external Stockfish bundles. If no external engine is available the helper automatically relies on the built-in worker.
+- **ENGINE SUGGESTIONS** – MultiPV lines reported by the active engine (built-in worker or Stockfish) with evaluation scores and search depth.
+- **ENGINE RECOMMENDATION** – The best move returned by the active engine, including the analyzed depth. When no external engine is running the helper still prints the heuristic **SIMPLE SUGGESTIONS** and **RECOMMENDATION** logs so you continue to receive guidance. The fallback output now appends the continuation it expects after the first move (for example `→ Nf3 Qe7 …`) so you can see the principal variation the built-in search prefers.
 - **FALLBACK SEARCH** – When Stockfish cannot be reached, this line reports the built-in search depth, how many candidate moves were evaluated, and roughly how long the search took (with a “time cutoff” tag if the helper stopped due to the time limit).
+
+## Offline Stockfish quickstart (recommended)
+
+The one-time workflow for storing Stockfish inside your browser now lives in a dedicated guide: [Offline Stockfish Quickstart](docs/offline-stockfish-quickstart.md). Follow it to capture a WebAssembly worker (or the `nmrugg/stockfish.js` asm.js build), encode it to base64, and persist it with `__CHESS.storeStockfishInline(...)` so the helper always boots a genuine Stockfish engine without touching the network.
+
+## Permanent Stockfish setup (other options)
+
+Prefer to host the worker yourself? The [Offline Stockfish Quickstart](docs/offline-stockfish-quickstart.md#appendix-a--hosting-the-worker-locally-optional) appendix now covers the full macOS hosting walkthrough, including the ready-to-run Python CORS server and the `window.__CHESS_STOCKFISH_URLS` override. Appendix B in the same document explains how to integrate the [`nmrugg/stockfish.js`](https://github.com/nmrugg/stockfish.js/) worker—specifically the current `src/stockfish-17.1-8e4d048.js` script—if you cannot obtain the official WASM build.
+
+## Engine selection
+
+- **Stored Stockfish (recommended):** When you keep a base64 payload in `localStorage` via `__CHESS.storeStockfishInline(...)`, the helper launches that worker first (`ENGINE SOURCE=inline:stored`). This guarantees genuine Stockfish analysis without network access.
+- **Session-only Stockfish:** Call `__CHESS.storeStockfishInline(base64, { persist: false })` to load a payload for the current tab only. It behaves like the stored version but is cleared when you refresh or close the page.
+- **Custom inline or hosted URLs:** You can still set `window.__CHESS_STOCKFISH_INLINE`, `window.__CHESS_STOCKFISH_INLINE_BASE64`, or `window.__CHESS_STOCKFISH_URLS` before running the helper to try bespoke builds or remote hosts. These sources run after your stored/session payloads but before the fallback engine.
+- **Built-in worker fallback:** If no Stockfish payload succeeds (or you clear the stored copy), the helper spins up its embedded worker (`ENGINE SOURCE=inline:builtin`) so you continue to receive analysed recommendations with no external dependencies.
 
 ## Using the `__CHESS` helpers
 The script exposes a convenience object on `window.__CHESS` after it runs:
 
 | Helper | Description |
 | --- | --- |
-| `__CHESS.version` | Returns the helper version tag (`helper-15`). |
+| `__CHESS.version` | Returns the helper version tag (`helper-18`). |
 | `__CHESS.fen()` | Current FEN string for the reconstructed position. |
 | `__CHESS.turn()` | Side to move (`'w'` or `'b'`). |
 | `__CHESS.legalSAN()` | Legal moves in SAN format. |
@@ -55,13 +70,17 @@ The script exposes a convenience object on `window.__CHESS` after it runs:
 | `__CHESS.ignored()` | Any tokens the helper could not reconcile with the legal history. |
 | `__CHESS.inferred()` | Tokens that required heuristic disambiguation. |
 | `__CHESS.best()` | The current textual recommendation (engine SAN and UCI when available; heuristic SAN otherwise). |
-| `__CHESS.suggestions()` | Either the engine’s MultiPV lines (including SAN, UCI, depth, and score) or the fallback heuristic scores. |
-| `__CHESS.engine()` | Details about the connected Stockfish instance (source URL, depth, best move, and raw lines) or `null` when unavailable. |
+| `__CHESS.suggestions()` | Either the engine’s MultiPV lines (including SAN, UCI, depth, and score) or the fallback heuristic scores with their principal-variation SAN (`pvSan`). |
+| `__CHESS.engine()` | Details about the connected engine (built-in worker or Stockfish) including source label, depth, best move, and raw lines, or `null` when no engine is active. |
 | `__CHESS.fallback()` | When Stockfish is unavailable, returns the fallback search depth, number of nodes evaluated, elapsed time (milliseconds), whether the search hit its time cap, and how many recursive calls ended early due to the limit. |
-| `__CHESS.stockfishFailures()` | Lists cached CDN failures (URL, reason, and timestamp) that the helper will currently skip. |
-| `__CHESS.stockfishDisabled()` | Indicates whether Stockfish attempts are currently disabled after repeated failures. |
+| `__CHESS.stockfishFailures()` | Lists recorded URL failures (address, reason, and timestamp) from recent attempts. |
+| `__CHESS.stockfishInfo()` | Summarises the active engine source, stored/session payload sizes, disable flag, and cached failures. |
+| `__CHESS.storeStockfishInline(base64, options)` | Validates and stores a base64 Stockfish worker (`persist: true` by default, use `{ persist: false }` for session-only). |
+| `__CHESS.storeStockfishFromUrl(url, options)` | Fetches a worker script from a CORS-friendly URL, converts it to base64, and stores it using the same options as above. |
+| `__CHESS.clearStoredStockfishInline()` | Removes both stored and session inline payloads so the helper falls back to other sources. |
+| `__CHESS.stockfishDisabled()` | Indicates whether Stockfish attempts have been disabled manually for the current session. |
 | `__CHESS.disableStockfish()` | Manually disable future Stockfish attempts (useful when you always want to rely on the built-in engine). |
-| `__CHESS.enableStockfish()` | Re-enable CDN Stockfish attempts (clear cached failures or set `window.__CHESS_STOCKFISH_RETRY = true` before rerunning if needed). |
+| `__CHESS.enableStockfish()` | Re-enable external Stockfish attempts (they are retried automatically unless you explicitly disable them). |
 | `__CHESS.clearStockfishFailures()` | Clears the cached failure list so the default URLs are retried on the next run. |
 | `__CHESS.trySan(san)` | Try a SAN move against the reconstructed position (without mutating the live state). |
 | `__CHESS.tryFromTo(from, to, promotion)` | Try a coordinate move with optional promotion piece. |
@@ -69,9 +88,10 @@ The script exposes a convenience object on `window.__CHESS` after it runs:
 You can call these utilities directly from the console to double-check the helper’s output or to experiment with candidate moves.
 
 ## Troubleshooting tips
+- **Stockfish keeps falling back to the built-in engine** – Run `__CHESS.stockfishInfo()` to confirm whether a stored payload is available. If `storedInline` is `false`, re-run `__CHESS.storeStockfishInline(...)`. If it shows an old failure reason, clear the cache via `__CHESS.clearStoredStockfishInline()` and store a fresh copy.
 - **Token source is `text` with many ignored tokens** – Ensure the move list is visible and scrolled into view. chess.com occasionally virtualizes older moves; scrolling to the top helps the helper read the full history.
-- **Recommendation feels off** – The helper first tries to load Stockfish. If the engine cannot be reached (you will see an `ENGINE ERROR` message), the script now performs a deeper alpha-beta search with quiescence, transposition tables, and positional evaluation. Ensure your browser permits cross-origin requests to the listed CDN URLs or manually provide the engine bundle using one of the customization options below.
-- **Engine script returns HTML** – Some CDNs respond with an HTML error page. The helper now detects this situation, skips the bad response, caches the failure, and continues trying the remaining URLs automatically.
+- **Recommendation feels off** – The built-in worker already performs iterative deepening with quiescence, transposition tables, killer/history move ordering, move-safety checks, and positional evaluation. If you want to compare its output with Stockfish, disable the built-in worker for a run (`window.__CHESS_DISABLE_BUILTIN_ENGINE = true`) and provide working Stockfish URLs or inline payloads as described below.
+- **Engine script returns HTML** – Some hosts respond with an HTML error page. The helper now detects this situation, skips the bad response, caches the failure, and continues trying the remaining URLs automatically.
 - **Need to rerun automatically** – Save the helper as a bookmarklet or snippet so you can execute it with a single click whenever you want a fresh evaluation.
 
 ## Resolving merge conflicts for this helper
@@ -85,26 +105,26 @@ If you simply want to keep the newest version of the helper that you are pulling
 
 ## Customizing the engine source
 
-The helper tries a sequence of Stockfish builds hosted on jsDelivr, stockfish.online, stockfishchess.org, and cdnjs. If all of them fail in your environment (for example due to a firewall), you can supply your own list before running the helper:
+The embedded worker is used by default. To force the helper to skip it and try external engines only, set `window.__CHESS_DISABLE_BUILTIN_ENGINE = true` before running the helper. External engines are **not** fetched automatically anymore; provide explicit URLs when you have a hosted copy of the Stockfish WASM worker you trust:
 
 ```js
 window.__CHESS_STOCKFISH_URLS = [
-  'https://example.com/path/to/stockfish.js',
-  'https://fallback.example.org/another-stockfish.js'
+  'https://example.com/path/to/stockfish.wasm.js',
+  'https://fallback.example.org/another-worker.js'
 ];
 ```
 
-Paste that snippet into the console first (or save it as a bookmarklet), then run the helper. Your URLs will be tried before the defaults, and any duplicates are ignored. This makes it easy to host a vetted build on your own domain or local network when public CDNs are unavailable.
+Paste that snippet into the console first (or save it as a bookmarklet), then run the helper. Each URL is tried in order until one succeeds. This makes it easy to host a vetted build on your own domain or local network when public hosts are unavailable.
 
 If you would rather provide the engine source directly, you can inline the worker script or a base64-encoded copy before running the helper:
 
 ```js
-window.__CHESS_STOCKFISH_INLINE = `/* contents of stockfish.js */`;
+window.__CHESS_STOCKFISH_INLINE = `/* contents of stockfish.wasm.js */`;
 // or
 window.__CHESS_STOCKFISH_INLINE_BASE64 = 'LyogYmFzZTY0LWVuY29kZWQgc3RvY2tmaXNoLmpzICov';
 ```
 
-When either variable is set, the helper spawns Stockfish locally without fetching from a CDN, which avoids CORS issues entirely.
+When either variable is set, the helper spawns Stockfish locally without fetching from the network, which avoids CORS issues entirely.
 
 ### Tuning the fallback search
 
@@ -116,34 +136,26 @@ window.__CHESS_FALLBACK_TIME = 2500; // allow up to 2.5 seconds for the built-in
 
 Larger values explore deeper trees at the cost of additional computation time. If you prefer near-instant suggestions, set the value closer to `500`.
 
-### Cached CDN failures and retries
+### Cached URL failures and retries
 
-To reduce repeated 404 errors or CORS violations in the console, the helper now remembers which Stockfish URLs failed most recently and skips them on subsequent runs. The cache is stored in `localStorage` for seven days. You can inspect the skipped entries via:
+To help with debugging remote-host issues, the helper records recent Stockfish URL failures (reason and timestamp) in `localStorage`. By default it still retries every URL on the next run, but you can inspect the recorded entries via:
 
 ```js
 __CHESS.stockfishFailures();
 ```
 
-To retry the default CDN list immediately, either clear the cache:
+To clear the recorded failures (useful if you want a clean log) call:
 
 ```js
 __CHESS.clearStockfishFailures();
 ```
 
-or set a one-time override before running the helper:
+If you prefer to **skip** retrying previously failed URLs (for example when a firewall blocks them and you do not want to see the repeated network errors), set this before running the helper:
 
 ```js
-window.__CHESS_STOCKFISH_RETRY = true;
+window.__CHESS_STOCKFISH_RETRY = false;
 ```
 
-Both options cause the helper to re-attempt every URL on the next run, which is useful after network conditions change or you add a new CDN mirror.
+With the flag set to `false`, cached failures are skipped until you clear them or reload the page.
 
-### Automatic Stockfish disablement after repeated failures
-
-If every Stockfish URL fails during a run (for example due to firewalls, offline access, or strict CORS policies), the helper now disables further CDN attempts automatically. Subsequent runs fall back to the built-in search immediately instead of retrying URLs that are likely to fail, eliminating repeated console noise. When you are ready to try again, call:
-
-```js
-__CHESS.enableStockfish();
-```
-
-You can also disable attempts pre-emptively with `__CHESS.disableStockfish()` if you prefer to rely solely on the built-in engine. Clearing the cached failures and re-enabling Stockfish allows the helper to test the default URL list again on the next run.
+Because retries are now automatic, the helper no longer disables Stockfish on its own. Use `__CHESS.disableStockfish()` or `__CHESS.enableStockfish()` when you want to opt out or opt back in manually.
